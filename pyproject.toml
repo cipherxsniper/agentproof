@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentproof"
+version = "0.1.0"
+description = "Cryptographically signed, tamper-evident audit logs for autonomous agents"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Thomas Lee Harvey" }]
+requires-python = ">=3.9"
+dependencies = [
+    "cryptography>=41.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security :: Cryptography",
+]
+
+[project.scripts]
+agentproof = "agentproof.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tommyleeharvey/agentproof"
+
+[tool.setuptools.packages.find]
+include = ["agentproof*"]
