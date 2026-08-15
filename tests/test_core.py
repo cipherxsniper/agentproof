@@ -133,3 +133,41 @@ def test_proofchain_class_wrapper(tmp_log, key):
     ok, msg = chain.verify()
     assert ok is True
     assert "2 entries verified" in msg
+
+
+def test_malformed_key_length_raises(tmp_log):
+    from agentproof.core import ProofChainError
+
+    too_short = b"\x00" * 16
+    with pytest.raises(ProofChainError, match="expected exactly 32"):
+        sign_event(tmp_log, "tool_call", {}, signing_key=too_short)
+
+    too_long_b64 = base64.b64encode(b"\x00" * 48).decode()
+    with pytest.raises(ProofChainError, match="expected exactly 32"):
+        sign_event(tmp_log, "tool_call", {}, signing_key=too_long_b64)
+
+
+def test_corrupt_tail_raises_on_sign(tmp_log, key):
+    from agentproof.core import ProofChainError
+
+    raw, _ = key
+    sign_event(tmp_log, "tool_call", {"i": 0}, signing_key=raw)
+
+    # simulate a crash mid-append: a truncated, non-JSON final line
+    with open(tmp_log, "a") as f:
+        f.write('{"type": "tool_call", "data": {"i": 1}, "prev_ha')
+
+    with pytest.raises(ProofChainError, match="corrupt or incomplete"):
+        sign_event(tmp_log, "tool_call", {"i": 2}, signing_key=raw)
+
+
+def test_corrupt_tail_reported_cleanly_on_verify(tmp_log, key):
+    raw, _ = key
+    sign_event(tmp_log, "tool_call", {"i": 0}, signing_key=raw)
+
+    with open(tmp_log, "a") as f:
+        f.write('{"type": "tool_call", "data": {"i": 1}, "prev_ha')
+
+    ok, msg = verify_log(tmp_log, signing_key=raw)
+    assert ok is False
+    assert "not valid JSON" in msg

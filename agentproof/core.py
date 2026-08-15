@@ -11,9 +11,15 @@ Design goals:
   - No dependency on any particular agent framework. This module has no
     opinion about what an "event" is; it just signs whatever dict you
     give it.
+  - Appends are serialized with an OS file lock and fsync'd, so
+    concurrent writers can't race on prev_hash and the entry is durable
+    on disk before sign_event() returns.
+  - Key material is never silently truncated or padded — a malformed
+    key length is a hard error, not a guess.
 """
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -28,10 +34,22 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 KeyLike = Union[bytes, str, None]
+_ED25519_KEY_LEN = 32
 
 
 class ProofChainError(Exception):
-    """Raised for configuration errors (e.g. no key available)."""
+    """Raised for configuration errors (e.g. no key available) or log corruption."""
+
+
+def _require_key_len(raw: bytes, source: str) -> bytes:
+    if len(raw) != _ED25519_KEY_LEN:
+        raise ProofChainError(
+            f"key from {source} is {len(raw)} bytes, expected exactly "
+            f"{_ED25519_KEY_LEN} for Ed25519. Refusing to truncate or pad "
+            f"— check that the key material wasn't corrupted or copied "
+            f"partially."
+        )
+    return raw
 
 
 def _load_signer(
@@ -43,14 +61,14 @@ def _load_signer(
     """
     Resolve a private signing key from, in order of precedence:
       1. `signing_key` passed directly (raw 32 bytes, or a base64 string)
-      2. `env_var` (base64-encoded 32-byte key) — e.g. for platforms like
-         Render/Fly/Heroku where there's no persistent filesystem
+      2. `env_var` (base64-encoded 32-byte key)
       3. `keyfile` passed directly (path to a JSON file with a "secret"
          field, or a raw JSON array of ints — matches the original
          omega_proof.py format for backward compatibility)
       4. `keyfile_env_var` (path to the same kind of JSON file)
 
-    Raises ProofChainError if none of these resolve to a usable key.
+    Raises ProofChainError if none of these resolve to a usable key, or
+    if a resolved key is not exactly 32 bytes.
     No placeholder or randomly-generated key is ever silently substituted.
     """
     raw: Optional[bytes] = None
@@ -61,13 +79,14 @@ def _load_signer(
     if raw is None:
         b64 = os.environ.get(env_var)
         if b64:
-            raw = base64.b64decode(b64)[:32]
+            raw = _require_key_len(base64.b64decode(b64), f"env var {env_var}")
 
     if raw is None:
         path = keyfile or os.environ.get(keyfile_env_var)
         if path:
             data = json.loads(Path(path).expanduser().read_text())
-            raw = bytes(data["secret"][:32]) if isinstance(data, dict) else bytes(data[:32])
+            candidate = bytes(data["secret"]) if isinstance(data, dict) else bytes(data)
+            raw = _require_key_len(candidate, f"keyfile {path}")
 
     if raw is None:
         raise ProofChainError(
@@ -82,9 +101,9 @@ def _load_signer(
 
 def _coerce_key_bytes(signing_key: Union[bytes, str]) -> bytes:
     if isinstance(signing_key, bytes):
-        return signing_key[:32]
+        return _require_key_len(signing_key, "signing_key (bytes)")
     if isinstance(signing_key, str):
-        return base64.b64decode(signing_key)[:32]
+        return _require_key_len(base64.b64decode(signing_key), "signing_key (str)")
     raise ProofChainError("signing_key must be bytes or a base64-encoded str")
 
 
@@ -109,11 +128,36 @@ def _private_bytes_fallback(priv: Ed25519PrivateKey) -> bytes:
     )
 
 
+def _lock_path(log_path: Path) -> Path:
+    return log_path.with_name(log_path.name + ".lock")
+
+
+def _read_last_entry_hash(log_path: Path) -> str:
+    """
+    Return the entry_hash of the last complete line in log_path, or
+    "genesis" if the log doesn't exist or is empty.
+    Raises ProofChainError if the last line exists but isn't valid JSON
+    with an entry_hash — i.e. a partial write from a crash mid-append —
+    rather than silently treating a corrupt tail as if it weren't there.
+    """
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return "genesis"
+    last_line = log_path.read_text().strip().splitlines()[-1]
+    try:
+        parsed = json.loads(last_line)
+        return parsed["entry_hash"]
+    except (json.JSONDecodeError, KeyError) as e:
+        raise ProofChainError(
+            f"log {log_path} has a corrupt or incomplete final line "
+            f"(likely a partial write from a crash mid-append): {e}. "
+            f"Manual recovery required — do not append blindly on top "
+            f"of this without inspecting the tail."
+        )
+
+
+# Kept for backward compatibility with any external callers.
 def _prev_hash(log_path: Path) -> str:
-    if log_path.exists() and log_path.stat().st_size > 0:
-        last_line = log_path.read_text().strip().splitlines()[-1]
-        return json.loads(last_line)["entry_hash"]
-    return "genesis"
+    return _read_last_entry_hash(log_path)
 
 
 class ProofChain:
@@ -176,27 +220,42 @@ def sign_event(
     """
     Sign one event and append it to the hash-chained JSONL log at
     log_path. Returns the full entry that was written.
+
+    The read-prev-hash + sign + append is done under an exclusive OS
+    file lock on a sibling `.lock` file, and the write is flushed and
+    fsync'd before the lock is released — so concurrent callers can't
+    race on prev_hash (which would silently fork the chain), and a
+    completed call means the entry is durably on disk, not just in a
+    page cache.
     """
     priv, _ = _load_signer(signing_key, keyfile, env_var, keyfile_env_var)
     log_path = Path(log_path).expanduser()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    entry = {
-        "type": event_type,
-        "data": data,
-        "prev_hash": _prev_hash(log_path),
-        "signed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    msg = json.dumps(entry, sort_keys=True, default=str).encode()
-    sig = base64.b64encode(priv.sign(msg)).decode()
-    entry_hash = hashlib.sha256(msg + sig.encode()).hexdigest()
-    entry["signature"] = sig
-    entry["entry_hash"] = entry_hash
+    lock_path = _lock_path(log_path)
+    with open(lock_path, "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            entry = {
+                "type": event_type,
+                "data": data,
+                "prev_hash": _read_last_entry_hash(log_path),
+                "signed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            msg = json.dumps(entry, sort_keys=True, default=str).encode()
+            sig = base64.b64encode(priv.sign(msg)).decode()
+            entry_hash = hashlib.sha256(msg + sig.encode()).hexdigest()
+            entry["signature"] = sig
+            entry["entry_hash"] = entry_hash
 
-    with open(log_path, "a") as f:
-        f.write(json.dumps(entry, default=str) + "\n")
+            with open(log_path, "a") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
 
-    return entry
+            return entry
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 def verify_log(
@@ -213,15 +272,13 @@ def verify_log(
     on success, or (False, "<reason>") on the first failure found.
 
     If pubkey_bytes is not given, the public key is derived from whatever
-    private key resolves via signing_key/keyfile/env vars — i.e. the same
-    identity that would sign new events. For third-party verification
-    (someone checking your log without your private key), pass the
-    public key bytes explicitly instead.
+    private key resolves via signing_key/keyfile/env vars. For
+    third-party verification (someone checking your log without your
+    private key), pass the public key bytes explicitly instead.
     """
     log_path = Path(log_path).expanduser()
     if not log_path.exists():
         return False, "log does not exist"
-
     if pubkey_bytes is None:
         _, pub = _load_signer(signing_key, keyfile, env_var, keyfile_env_var)
     else:
@@ -233,13 +290,19 @@ def verify_log(
 
     expected_prev = "genesis"
     for i, line in enumerate(lines):
-        entry = json.loads(line)
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return False, f"entry {i} is not valid JSON — corrupt or partial write"
 
         if entry.get("prev_hash") != expected_prev:
             return False, f"chain broken at entry {i}: prev_hash mismatch"
 
-        sig_b64 = entry["signature"]
-        entry_hash = entry["entry_hash"]
+        sig_b64 = entry.get("signature")
+        entry_hash = entry.get("entry_hash")
+        if sig_b64 is None or entry_hash is None:
+            return False, f"entry {i} missing signature or entry_hash"
+
         check_entry = {k: v for k, v in entry.items() if k not in ("signature", "entry_hash")}
         msg = json.dumps(check_entry, sort_keys=True, default=str).encode()
 
