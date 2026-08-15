@@ -23,6 +23,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -339,3 +340,119 @@ def export_public_key(
         format=serialization.PublicFormat.Raw,
     )
     return base64.b64encode(raw).decode()
+
+
+def rotate_key(
+    old_log_path,
+    new_log_path,
+    new_signing_key,
+    old_signing_key=None,
+    old_keyfile=None,
+    old_env_var="AGENTPROOF_SIGNING_KEY",
+    old_keyfile_env_var="AGENTPROOF_KEYFILE",
+):
+    """
+    Retire old_log_path (signed under the old key) and start a fresh
+    chain segment at new_log_path signed under new_signing_key.
+
+    Old entries are NOT re-signed and remain valid under the old public
+    key forever -- rotation does not rewrite history. The new segment's
+    first entry records the old segment's final entry_hash and public
+    key, so a verifier walking full history can link segment B back to
+    segment A explicitly, rather than trusting an open-ended key list.
+
+    Raises ProofChainError if old_log_path doesn't exist/is empty, or
+    if new_log_path already exists.
+    """
+    old_log_path = Path(old_log_path).expanduser()
+    new_log_path = Path(new_log_path).expanduser()
+
+    if not old_log_path.exists() or old_log_path.stat().st_size == 0:
+        raise ProofChainError(f"old log {old_log_path} does not exist or is empty -- nothing to rotate from")
+    if new_log_path.exists():
+        raise ProofChainError(f"new log {new_log_path} already exists -- rotate_key will not overwrite or append to an existing log")
+
+    old_final_hash = _read_last_entry_hash(old_log_path)
+    if old_final_hash == "genesis":
+        raise ProofChainError(f"old log {old_log_path} has no valid entries to rotate from")
+
+    old_pub_b64 = export_public_key(
+        signing_key=old_signing_key,
+        keyfile=old_keyfile,
+        env_var=old_env_var,
+        keyfile_env_var=old_keyfile_env_var,
+    )
+
+    entry = sign_event(
+        new_log_path,
+        "key_rotation",
+        {
+            "prev_chain_log": str(old_log_path),
+            "prev_chain_final_hash": old_final_hash,
+            "prev_chain_pubkey": old_pub_b64,
+        },
+        signing_key=new_signing_key,
+    )
+    return entry
+
+
+def verify_chain_history(
+    log_path,
+    pubkey_bytes=None,
+    signing_key=None,
+    keyfile=None,
+    env_var="AGENTPROOF_SIGNING_KEY",
+    keyfile_env_var="AGENTPROOF_KEYFILE",
+):
+    """
+    Like verify_log, but if the log's first entry is a "key_rotation"
+    event linking back to a prior segment, recursively verifies that
+    prior segment too (under ITS recorded public key), and confirms
+    the linkage itself is genuine: the prior segment's actual final
+    entry_hash must match what this segment's rotation entry claims.
+
+    Returns (True, "<n> entries verified, chain intact (<k> segments)")
+    on full success, or (False, "<reason>") on the first failure --
+    in this segment or any linked prior one.
+    """
+    log_path = Path(log_path).expanduser()
+    ok, msg = verify_log(
+        log_path, pubkey_bytes=pubkey_bytes, signing_key=signing_key,
+        keyfile=keyfile, env_var=env_var, keyfile_env_var=keyfile_env_var,
+    )
+    if not ok:
+        return False, msg
+
+    lines = log_path.read_text().strip().splitlines()
+    first = json.loads(lines[0])
+    total = len(lines)
+
+    if first.get("type") != "key_rotation":
+        return True, f"{total} entries verified, chain intact (1 segments)"
+
+    link = first["data"]
+    prev_log = Path(link["prev_chain_log"])
+    prev_pub_bytes = base64.b64decode(link["prev_chain_pubkey"])
+
+    if not prev_log.exists():
+        return False, f"linked prior segment {prev_log} not found -- cannot verify full history"
+
+    prev_ok, prev_msg = verify_chain_history(prev_log, pubkey_bytes=prev_pub_bytes)
+    if not prev_ok:
+        return False, f"linked prior segment {prev_log} failed verification: {prev_msg}"
+
+    prev_lines = prev_log.read_text().strip().splitlines()
+    prev_final_hash = json.loads(prev_lines[-1])["entry_hash"]
+    if prev_final_hash != link["prev_chain_final_hash"]:
+        return False, (
+            f"rotation link mismatch: this segment claims prior final "
+            f"hash {link['prev_chain_final_hash']}, but {prev_log}'s "
+            f"actual final hash is {prev_final_hash}"
+        )
+
+    prev_total_match = re.search(r"(\d+) entries verified", prev_msg)
+    prev_segments_match = re.search(r"\((\d+) segments\)", prev_msg)
+    prev_total = int(prev_total_match.group(1))
+    prev_segments = int(prev_segments_match.group(1)) if prev_segments_match else 1
+
+    return True, f"{total + prev_total} entries verified, chain intact ({1 + prev_segments} segments)"

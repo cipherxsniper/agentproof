@@ -171,3 +171,105 @@ def test_corrupt_tail_reported_cleanly_on_verify(tmp_log, key):
     ok, msg = verify_log(tmp_log, signing_key=raw)
     assert ok is False
     assert "not valid JSON" in msg
+
+
+def test_rotate_key_links_segments(tmp_path, key):
+    from agentproof import rotate_key, verify_chain_history
+
+    old_raw, _ = key
+    old_log = tmp_path / "segment_a.log"
+    new_log = tmp_path / "segment_b.log"
+
+    for i in range(3):
+        sign_event(old_log, "step", {"i": i}, signing_key=old_raw)
+
+    new_raw, _ = generate_key()
+    rotation_entry = rotate_key(old_log, new_log, new_signing_key=new_raw, old_signing_key=old_raw)
+
+    assert rotation_entry["type"] == "key_rotation"
+    assert rotation_entry["data"]["prev_chain_log"] == str(old_log)
+
+    for i in range(3):
+        sign_event(new_log, "step", {"i": 100 + i}, signing_key=new_raw)
+
+    ok, msg = verify_chain_history(new_log, signing_key=new_raw)
+    assert ok is True
+    assert "7 entries verified" in msg  # 3 old + 1 rotation + 3 new
+    assert "2 segments" in msg
+
+
+def test_rotate_key_rejects_empty_old_log(tmp_path):
+    from agentproof import rotate_key
+
+    empty_old = tmp_path / "empty.log"
+    new_log = tmp_path / "new.log"
+    new_raw, _ = generate_key()
+
+    with pytest.raises(ProofChainError, match="does not exist or is empty"):
+        rotate_key(empty_old, new_log, new_signing_key=new_raw)
+
+
+def test_rotate_key_refuses_to_overwrite_existing_new_log(tmp_path, key):
+    from agentproof import rotate_key
+
+    old_raw, _ = key
+    old_log = tmp_path / "old.log"
+    sign_event(old_log, "step", {"i": 0}, signing_key=old_raw)
+
+    new_log = tmp_path / "new.log"
+    new_raw, _ = generate_key()
+    sign_event(new_log, "unrelated", {}, signing_key=new_raw)  # pre-existing file
+
+    with pytest.raises(ProofChainError, match="already exists"):
+        rotate_key(old_log, new_log, new_signing_key=new_raw, old_signing_key=old_raw)
+
+
+def test_verify_chain_history_catches_tampered_link(tmp_path, key):
+    from agentproof import rotate_key, verify_chain_history
+
+    old_raw, _ = key
+    old_log = tmp_path / "segment_a.log"
+    new_log = tmp_path / "segment_b.log"
+
+    sign_event(old_log, "step", {"i": 0}, signing_key=old_raw)
+    new_raw, _ = generate_key()
+    rotate_key(old_log, new_log, new_signing_key=new_raw, old_signing_key=old_raw)
+
+    # append one more real entry to the OLD segment after rotation --
+    # this makes the recorded prev_chain_final_hash stale/wrong
+    sign_event(old_log, "step", {"i": 1}, signing_key=old_raw)
+
+    ok, msg = verify_chain_history(new_log, signing_key=new_raw)
+    assert ok is False
+    assert "rotation link mismatch" in msg
+
+
+def test_verify_chain_history_catches_missing_prior_segment(tmp_path, key):
+    from agentproof import rotate_key, verify_chain_history
+
+    old_raw, _ = key
+    old_log = tmp_path / "segment_a.log"
+    new_log = tmp_path / "segment_b.log"
+
+    sign_event(old_log, "step", {"i": 0}, signing_key=old_raw)
+    new_raw, _ = generate_key()
+    rotate_key(old_log, new_log, new_signing_key=new_raw, old_signing_key=old_raw)
+
+    old_log.unlink()  # simulate the prior segment file being lost
+
+    ok, msg = verify_chain_history(new_log, signing_key=new_raw)
+    assert ok is False
+    assert "not found" in msg
+
+
+def test_verify_chain_history_single_segment_unchanged(tmp_log, key):
+    from agentproof import verify_chain_history
+
+    raw, _ = key
+    for i in range(4):
+        sign_event(tmp_log, "step", {"i": i}, signing_key=raw)
+
+    ok, msg = verify_chain_history(tmp_log, signing_key=raw)
+    assert ok is True
+    assert "4 entries verified" in msg
+    assert "1 segments" in msg
